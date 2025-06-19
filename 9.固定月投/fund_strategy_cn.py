@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------------
-# 实战项目: MACD 趋势跟踪策略
+# 实战项目: 纯固定定投策略 (无脑定投)
 # ----------------------------------------------------------------------------------
 
 import backtrader as bt
@@ -15,13 +15,12 @@ FUND_SYMBOL = '003096'          # 基金代码
 BENCHMARK_SYMBOL = 'sh000300'   # 基准指数代码
 START_DATE = '20200812'         # 回测开始日期
 END_DATE = '20250127'           # 回测结束日期
-INITIAL_CASH = 100000.0         # 初始资金
+INITIAL_CASH = 200000.0         # 初始资金 (定投策略需要较多现金)
 COMMISSION_RATE = 0.0015        # 手续费率
 
-# --- MACD策略参数 ---
-MACD_FAST_PERIOD = 12             # 短期EMA周期
-MACD_SLOW_PERIOD = 26             # 长期EMA周期
-MACD_SIGNAL_PERIOD = 9            # DEA线的EMA周期
+# --- 纯固定定投策略参数 ---
+INVESTMENT_DAY = 1                # 每月定投日 (例如: 1号)
+FIXED_INVESTMENT_AMOUNT = 2000.0  # 每月固定投资金额
 
 # ==================================================================================
 # 第2步：数据获取与整合 (代码与之前版本相同)
@@ -57,34 +56,20 @@ def get_fund_and_benchmark_data(fund_symbol, benchmark_symbol, start, end):
     return data, benchmark_df['close']
 
 # ==================================================================================
-# 第3步：策略定义 - MACD 趋势跟踪策略
+# 第3步：策略定义 - 纯固定定投策略
 # ==================================================================================
-class MacdStrategy(bt.Strategy):
+class FixedAutoInvestStrategy(bt.Strategy):
     params = (
-        ('fast_period', MACD_FAST_PERIOD),
-        ('slow_period', MACD_SLOW_PERIOD),
-        ('signal_period', MACD_SIGNAL_PERIOD),
+        ('investment_day', INVESTMENT_DAY),
+        ('investment_amount', FIXED_INVESTMENT_AMOUNT),
     )
 
     def __init__(self):
-        # 使用 backtrader 内置的MACD指标
-        self.macd = bt.indicators.MACD(
-            self.data.close,
-            period_me1=self.p.fast_period,
-            period_me2=self.p.slow_period,
-            period_signal=self.p.signal_period
-        )
-        
-        # 使用 CrossOver 指标来辅助判断金叉和死叉
-        # self.macd.macd 是 DIF 快线
-        # self.macd.signal 是 DEA 慢线
-        self.crossover = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
-        
-        # 订单跟踪
         self.order = None
+        # 记录上一个定投的月份，防止一个月内重复投资
+        self.last_investment_month = -1
 
     def notify_order(self, order):
-        # (这部分代码与之前相同，用于打印交易日志)
         if order.status in [order.Submitted, order.Accepted]:
             return
         if order.status in [order.Completed]:
@@ -92,16 +77,7 @@ class MacdStrategy(bt.Strategy):
                 print(
                     f"\n--- 交易执行 ---\n"
                     f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD金叉，买入 (BUY)\n"
-                    f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
-                    f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
-                    f"-----------------"
-                )
-            elif order.issell():
-                print(
-                    f"\n--- 交易执行 ---\n"
-                    f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD死叉，卖出 (SELL)\n"
+                    f"操作: 固定定投买入 (BUY)\n"
                     f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
                     f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
                     f"-----------------"
@@ -112,27 +88,29 @@ class MacdStrategy(bt.Strategy):
             self.order = None
 
     def next(self):
-        # 如果有订单正在处理，则等待
         if self.order:
             return
 
-        # 如果当前没有持仓
-        if not self.position:
-            # 检查是否出现金叉 (crossover > 0)
-            if self.crossover > 0:
-                print(f"\n{self.data.datetime.date()}: MACD金叉形成，准备买入。")
-                # 使用 Sizer 全仓买入
-                self.order = self.buy()
-        # 如果当前持有仓位
-        else:
-            # 检查是否出现死叉 (crossover < 0)
-            if self.crossover < 0:
-                print(f"\n{self.data.datetime.date()}: MACD死叉形成，准备卖出。")
-                # 卖出全部仓位
-                self.order = self.close()
+        # 核心逻辑：只在每月固定日期无条件买入
+        current_date = self.data.datetime.date()
+        current_month = current_date.month
+        
+        # 判断是否是新的月份的定投时点
+        if current_month != self.last_investment_month and current_date.day >= self.p.investment_day:
+            
+            # 更新投资月份，确保本月只投一次
+            self.last_investment_month = current_month
+            
+            print(f"\n{current_date}: 到达定投日，准备无条件买入。")
+            
+            # 检查现金是否足够
+            if self.broker.get_cash() > self.p.investment_amount:
+                size_to_buy = self.p.investment_amount / self.data.close[0]
+                self.order = self.buy(size=size_to_buy)
+            else:
+                print(f"{current_date}: 现金不足，无法定投。")
 
     def stop(self):
-        # (这部分代码与之前相同，用于生成报告)
         print("\n回测结束，正在生成绩效报告...")
         global benchmark_data
         time_return_analyzer = self.analyzers.getbyname('time_return')
@@ -141,10 +119,10 @@ class MacdStrategy(bt.Strategy):
         if returns.index.tz is not None:
             returns.index = returns.index.tz_localize(None)
         benchmark_rets = benchmark_data.pct_change().dropna()
-        report_filename = f'strategy_report_{FUND_SYMBOL}_macd.html'
+        report_filename = f'strategy_report_{FUND_SYMBOL}_fixed_invest.html'
         try:
             qs.reports.html(returns, benchmark=benchmark_rets, output=report_filename, 
-                            title=f'{FUND_SYMBOL} - MACD 趋势跟踪策略 vs. 基准指数')
+                            title=f'{FUND_SYMBOL} - 纯固定定投策略 vs. 基准指数')
             print(f"绩效报告已成功生成：{report_filename}")
         except Exception as e:
             print(f"生成 quantstats 报告时出错: {e}")
@@ -161,14 +139,11 @@ if __name__ == '__main__':
         data_feed = bt.feeds.PandasData(dataname=fund_data, name=FUND_SYMBOL)
         cerebro.adddata(data_feed)
         
-        # 添加MACD策略
-        cerebro.addstrategy(MacdStrategy)
+        # 添加纯固定定投策略
+        cerebro.addstrategy(FixedAutoInvestStrategy)
         
         cerebro.broker.setcash(INITIAL_CASH)
         cerebro.broker.setcommission(commission=COMMISSION_RATE)
-        
-        # 使用 Sizer 来管理仓位，每次买入都用掉98%的现金
-        cerebro.addsizer(bt.sizers.PercentSizer, percents=98)
         
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='time_return')
         

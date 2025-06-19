@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------------
-# 实战项目: MACD 趋势跟踪策略
+# 实战项目: 固定百分比突破策略
 # ----------------------------------------------------------------------------------
 
 import backtrader as bt
@@ -18,10 +18,10 @@ END_DATE = '20250127'           # 回测结束日期
 INITIAL_CASH = 100000.0         # 初始资金
 COMMISSION_RATE = 0.0015        # 手续费率
 
-# --- MACD策略参数 ---
-MACD_FAST_PERIOD = 12             # 短期EMA周期
-MACD_SLOW_PERIOD = 26             # 长期EMA周期
-MACD_SIGNAL_PERIOD = 9            # DEA线的EMA周期
+# --- 固定百分比突破策略参数 ---
+PROFIT_TARGET_PCT = 0.05          # 止盈目标百分比 (5%)
+STOP_LOSS_PCT = 0.05            # 止损目标百分比 (5%)
+REBUY_TRIGGER_PCT = 0.05          # 从卖出价再次买入的触发百分比 (5%)
 
 # ==================================================================================
 # 第2步：数据获取与整合 (代码与之前版本相同)
@@ -57,52 +57,42 @@ def get_fund_and_benchmark_data(fund_symbol, benchmark_symbol, start, end):
     return data, benchmark_df['close']
 
 # ==================================================================================
-# 第3步：策略定义 - MACD 趋势跟踪策略
+# 第3步：策略定义 - 固定百分比突破策略
 # ==================================================================================
-class MacdStrategy(bt.Strategy):
+class FixedPercentageStrategy(bt.Strategy):
     params = (
-        ('fast_period', MACD_FAST_PERIOD),
-        ('slow_period', MACD_SLOW_PERIOD),
-        ('signal_period', MACD_SIGNAL_PERIOD),
+        ('profit_pct', PROFIT_TARGET_PCT),
+        ('loss_pct', STOP_LOSS_PCT),
+        ('rebuy_pct', REBUY_TRIGGER_PCT),
     )
 
     def __init__(self):
-        # 使用 backtrader 内置的MACD指标
-        self.macd = bt.indicators.MACD(
-            self.data.close,
-            period_me1=self.p.fast_period,
-            period_me2=self.p.slow_period,
-            period_signal=self.p.signal_period
-        )
-        
-        # 使用 CrossOver 指标来辅助判断金叉和死叉
-        # self.macd.macd 是 DIF 快线
-        # self.macd.signal 是 DEA 慢线
-        self.crossover = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
-        
-        # 订单跟踪
         self.order = None
+        # 这是本策略最关键的状态变量，用于记录上一次的卖出价
+        self.last_sell_price = 0.0
 
     def notify_order(self, order):
-        # (这部分代码与之前相同，用于打印交易日志)
         if order.status in [order.Submitted, order.Accepted]:
             return
+            
         if order.status in [order.Completed]:
             if order.isbuy():
                 print(
                     f"\n--- 交易执行 ---\n"
                     f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD金叉，买入 (BUY)\n"
+                    f"操作: 买入 (BUY)\n"
                     f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
                     f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
                     f"-----------------"
                 )
             elif order.issell():
+                # 在卖出成交时，记录下卖出价格！
+                self.last_sell_price = order.executed.price
                 print(
                     f"\n--- 交易执行 ---\n"
                     f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD死叉，卖出 (SELL)\n"
-                    f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
+                    f"操作: 卖出 (SELL)\n"
+                    f"成交份额: {order.executed.size:.2f}, 价格: {self.last_sell_price:.4f}\n"
                     f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
                     f"-----------------"
                 )
@@ -112,27 +102,45 @@ class MacdStrategy(bt.Strategy):
             self.order = None
 
     def next(self):
-        # 如果有订单正在处理，则等待
         if self.order:
             return
 
-        # 如果当前没有持仓
-        if not self.position:
-            # 检查是否出现金叉 (crossover > 0)
-            if self.crossover > 0:
-                print(f"\n{self.data.datetime.date()}: MACD金叉形成，准备买入。")
-                # 使用 Sizer 全仓买入
-                self.order = self.buy()
-        # 如果当前持有仓位
-        else:
-            # 检查是否出现死叉 (crossover < 0)
-            if self.crossover < 0:
-                print(f"\n{self.data.datetime.date()}: MACD死叉形成，准备卖出。")
-                # 卖出全部仓位
+        # 如果持有仓位，则判断止盈止损
+        if self.position:
+            buy_price = self.position.price # 获取持仓成本价
+            current_price = self.data.close[0]
+            
+            profit_target_price = buy_price * (1 + self.p.profit_pct)
+            stop_loss_price = buy_price * (1 - self.p.loss_pct)
+            
+            if current_price >= profit_target_price:
+                print(f"\n{self.data.datetime.date()}: 价格达到止盈点(>{profit_target_price:.4f})，准备卖出。")
                 self.order = self.close()
+            elif current_price <= stop_loss_price:
+                print(f"\n{self.data.datetime.date()}: 价格达到止损点(<{stop_loss_price:.4f})，准备卖出。")
+                self.order = self.close()
+        
+        # 如果空仓，则判断初始买入或再次买入
+        else:
+            # Case 1: 初始买入 (从未卖出过)
+            if self.last_sell_price == 0.0:
+                print(f"\n{self.data.datetime.date()}: 策略开始，执行初始全仓买入。")
+                self.order = self.buy()
+            
+            # Case 2: 再次买入 (已经有过卖出记录)
+            else:
+                current_price = self.data.close[0]
+                rebuy_up_price = self.last_sell_price * (1 + self.p.rebuy_pct)
+                rebuy_down_price = self.last_sell_price * (1 - self.p.rebuy_pct)
+                
+                if current_price >= rebuy_up_price:
+                    print(f"\n{self.data.datetime.date()}: 价格向上突破再买入点(>{rebuy_up_price:.4f})，准备买入。")
+                    self.order = self.buy()
+                elif current_price <= rebuy_down_price:
+                    print(f"\n{self.data.datetime.date()}: 价格向下突破再买入点(<{rebuy_down_price:.4f})，准备买入。")
+                    self.order = self.buy()
 
     def stop(self):
-        # (这部分代码与之前相同，用于生成报告)
         print("\n回测结束，正在生成绩效报告...")
         global benchmark_data
         time_return_analyzer = self.analyzers.getbyname('time_return')
@@ -141,10 +149,10 @@ class MacdStrategy(bt.Strategy):
         if returns.index.tz is not None:
             returns.index = returns.index.tz_localize(None)
         benchmark_rets = benchmark_data.pct_change().dropna()
-        report_filename = f'strategy_report_{FUND_SYMBOL}_macd.html'
+        report_filename = f'strategy_report_{FUND_SYMBOL}_fixed_pct.html'
         try:
             qs.reports.html(returns, benchmark=benchmark_rets, output=report_filename, 
-                            title=f'{FUND_SYMBOL} - MACD 趋势跟踪策略 vs. 基准指数')
+                            title=f'{FUND_SYMBOL} - 固定百分比突破策略 vs. 基准指数')
             print(f"绩效报告已成功生成：{report_filename}")
         except Exception as e:
             print(f"生成 quantstats 报告时出错: {e}")
@@ -157,19 +165,12 @@ if __name__ == '__main__':
 
     if fund_data is not None and not fund_data.empty:
         cerebro = bt.Cerebro()
-        
         data_feed = bt.feeds.PandasData(dataname=fund_data, name=FUND_SYMBOL)
         cerebro.adddata(data_feed)
-        
-        # 添加MACD策略
-        cerebro.addstrategy(MacdStrategy)
-        
+        cerebro.addstrategy(FixedPercentageStrategy)
         cerebro.broker.setcash(INITIAL_CASH)
         cerebro.broker.setcommission(commission=COMMISSION_RATE)
-        
-        # 使用 Sizer 来管理仓位，每次买入都用掉98%的现金
         cerebro.addsizer(bt.sizers.PercentSizer, percents=98)
-        
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='time_return')
         
         print("\n开始执行回测...")

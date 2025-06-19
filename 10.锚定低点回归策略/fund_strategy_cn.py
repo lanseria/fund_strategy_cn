@@ -1,32 +1,35 @@
 # ----------------------------------------------------------------------------------
-# 实战项目: MACD 趋势跟踪策略
+# 实战项目: 锚定低点回归策略
 # ----------------------------------------------------------------------------------
 
 import backtrader as bt
 import akshare as ak
 import pandas as pd
 import quantstats as qs
+import numpy as np
 
 # ==================================================================================
 # 第1步：参数配置
 # ==================================================================================
 # --- 基础配置 ---
-FUND_SYMBOL = '003096'          # 基金代码
+FUND_SYMBOL = '007301'          # 基金代码
 BENCHMARK_SYMBOL = 'sh000300'   # 基准指数代码
 START_DATE = '20200812'         # 回测开始日期
 END_DATE = '20250127'           # 回测结束日期
 INITIAL_CASH = 100000.0         # 初始资金
 COMMISSION_RATE = 0.0015        # 手续费率
 
-# --- MACD策略参数 ---
-MACD_FAST_PERIOD = 12             # 短期EMA周期
-MACD_SLOW_PERIOD = 26             # 长期EMA周期
-MACD_SIGNAL_PERIOD = 9            # DEA线的EMA周期
+# --- 策略参数 ---
+INITIAL_PROFIT_TARGET = 0.15      # 初始阶段止盈目标 (15%)
+CYCLE_PROFIT_TARGET = 0.10        # 循环阶段止盈目标 (10%)
+CYCLE_STOP_LOSS = 0.05            # 循环阶段止损目标 (5%)
+REBUY_TRIGGER_FROM_LOW = 0.03     # 从历史低点反弹多少后触发买入 (3%)
 
 # ==================================================================================
 # 第2步：数据获取与整合 (代码与之前版本相同)
 # ==================================================================================
 def get_fund_and_benchmark_data(fund_symbol, benchmark_symbol, start, end):
+    # ... (此函数代码与之前完全相同，此处省略以保持简洁) ...
     print("开始下载基金和基准数据...")
     try:
         fund_nav_df = ak.fund_open_fund_info_em(symbol=fund_symbol, indicator="单位净值走势")
@@ -55,84 +58,89 @@ def get_fund_and_benchmark_data(fund_symbol, benchmark_symbol, start, end):
     benchmark_df = benchmark_df[start:end]
     print("数据下载和整合完成。")
     return data, benchmark_df['close']
-
 # ==================================================================================
-# 第3步：策略定义 - MACD 趋势跟踪策略
+# 第3步：策略定义 - 锚定低点回归策略
 # ==================================================================================
-class MacdStrategy(bt.Strategy):
+class AnchorLowStrategy(bt.Strategy):
     params = (
-        ('fast_period', MACD_FAST_PERIOD),
-        ('slow_period', MACD_SLOW_PERIOD),
-        ('signal_period', MACD_SIGNAL_PERIOD),
+        ('initial_profit', INITIAL_PROFIT_TARGET),
+        ('cycle_profit', CYCLE_PROFIT_TARGET),
+        ('cycle_loss', CYCLE_STOP_LOSS),
+        ('rebuy_trigger', REBUY_TRIGGER_FROM_LOW),
     )
 
     def __init__(self):
-        # 使用 backtrader 内置的MACD指标
-        self.macd = bt.indicators.MACD(
-            self.data.close,
-            period_me1=self.p.fast_period,
-            period_me2=self.p.slow_period,
-            period_signal=self.p.signal_period
-        )
-        
-        # 使用 CrossOver 指标来辅助判断金叉和死叉
-        # self.macd.macd 是 DIF 快线
-        # self.macd.signal 是 DEA 慢线
-        self.crossover = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
-        
-        # 订单跟踪
         self.order = None
+        # 核心状态变量
+        self.strategy_phase = 1  # 1: 初始阶段, 2: 循环阶段
+        self.historical_low = float('inf') # 初始化历史最低价为无穷大
 
     def notify_order(self, order):
-        # (这部分代码与之前相同，用于打印交易日志)
+        # ... (此函数代码与之前相同，此处省略以保持简洁) ...
         if order.status in [order.Submitted, order.Accepted]:
             return
         if order.status in [order.Completed]:
+            # 只有卖出成交才可能改变策略阶段
+            if order.issell():
+                if self.strategy_phase == 1:
+                    print(f"*** 初始阶段完成，策略进入循环阶段！ ***")
+                    self.strategy_phase = 2
+            # 打印日志
             if order.isbuy():
-                print(
-                    f"\n--- 交易执行 ---\n"
-                    f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD金叉，买入 (BUY)\n"
-                    f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
-                    f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
-                    f"-----------------"
-                )
+                print(f"\n--- 交易执行: 买入 (BUY) ---\n"
+                      f"日期: {self.data.datetime.date(0)}, 价格: {order.executed.price:.4f}")
             elif order.issell():
-                print(
-                    f"\n--- 交易执行 ---\n"
-                    f"日期: {self.data.datetime.date(0)}\n"
-                    f"操作: MACD死叉，卖出 (SELL)\n"
-                    f"成交份额: {order.executed.size:.2f}, 价格: {order.executed.price:.4f}\n"
-                    f"交易金额: {order.executed.value:.2f}, 手续费: {order.executed.comm:.2f}\n"
-                    f"-----------------"
-                )
+                print(f"\n--- 交易执行: 卖出 (SELL) ---\n"
+                      f"日期: {self.data.datetime.date(0)}, 价格: {order.executed.price:.4f}")
             self.order = None
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             print(f"xx 订单失败/取消: {order.getstatusname()} xx")
             self.order = None
 
     def next(self):
-        # 如果有订单正在处理，则等待
         if self.order:
             return
 
-        # 如果当前没有持仓
-        if not self.position:
-            # 检查是否出现金叉 (crossover > 0)
-            if self.crossover > 0:
-                print(f"\n{self.data.datetime.date()}: MACD金叉形成，准备买入。")
-                # 使用 Sizer 全仓买入
+        current_price = self.data.close[0]
+        # 实时更新历史最低价
+        if current_price < self.historical_low:
+            self.historical_low = current_price
+
+        # --- 阶段一：初始建仓和15%止盈 ---
+        if self.strategy_phase == 1:
+            if not self.position:
+                print(f"\n{self.data.datetime.date()}: 策略启动，执行初始全仓买入。")
                 self.order = self.buy()
-        # 如果当前持有仓位
-        else:
-            # 检查是否出现死叉 (crossover < 0)
-            if self.crossover < 0:
-                print(f"\n{self.data.datetime.date()}: MACD死叉形成，准备卖出。")
-                # 卖出全部仓位
-                self.order = self.close()
+            else:
+                buy_price = self.position.price
+                profit_target_price = buy_price * (1 + self.p.initial_profit)
+                if current_price >= profit_target_price:
+                    print(f"\n{self.data.datetime.date()}: 价格达到初始止盈点(>{profit_target_price:.4f})，准备卖出。")
+                    self.order = self.close()
+        
+        # --- 阶段二：锚定低点，循环交易 ---
+        elif self.strategy_phase == 2:
+            if not self.position:
+                # 判断买入条件
+                rebuy_trigger_price = self.historical_low * (1 + self.p.rebuy_trigger)
+                if current_price <= rebuy_trigger_price:
+                    print(f"\n{self.data.datetime.date()}: 价格({current_price:.4f})接近历史低点({self.historical_low:.4f})，触发买入。")
+                    self.order = self.buy()
+            else:
+                # 判断卖出条件
+                buy_price = self.position.price
+                profit_target_price = buy_price * (1 + self.p.cycle_profit)
+                stop_loss_price = buy_price * (1 - self.p.cycle_loss)
+                
+                if current_price >= profit_target_price:
+                    print(f"\n{self.data.datetime.date()}: 价格达到循环止盈点(>{profit_target_price:.4f})，准备卖出。")
+                    self.order = self.close()
+                elif current_price <= stop_loss_price:
+                    print(f"\n{self.data.datetime.date()}: 价格达到循环止损点(<{stop_loss_price:.4f})，准备卖出。")
+                    self.order = self.close()
 
     def stop(self):
-        # (这部分代码与之前相同，用于生成报告)
+        # ... (此函数代码与之前相同，此处省略以保持简洁) ...
         print("\n回测结束，正在生成绩效报告...")
         global benchmark_data
         time_return_analyzer = self.analyzers.getbyname('time_return')
@@ -141,10 +149,10 @@ class MacdStrategy(bt.Strategy):
         if returns.index.tz is not None:
             returns.index = returns.index.tz_localize(None)
         benchmark_rets = benchmark_data.pct_change().dropna()
-        report_filename = f'strategy_report_{FUND_SYMBOL}_macd.html'
+        report_filename = f'strategy_report_{FUND_SYMBOL}_anchor_low.html'
         try:
             qs.reports.html(returns, benchmark=benchmark_rets, output=report_filename, 
-                            title=f'{FUND_SYMBOL} - MACD 趋势跟踪策略 vs. 基准指数')
+                            title=f'{FUND_SYMBOL} - 锚定低点回归策略 vs. 基准指数')
             print(f"绩效报告已成功生成：{report_filename}")
         except Exception as e:
             print(f"生成 quantstats 报告时出错: {e}")
@@ -157,19 +165,12 @@ if __name__ == '__main__':
 
     if fund_data is not None and not fund_data.empty:
         cerebro = bt.Cerebro()
-        
         data_feed = bt.feeds.PandasData(dataname=fund_data, name=FUND_SYMBOL)
         cerebro.adddata(data_feed)
-        
-        # 添加MACD策略
-        cerebro.addstrategy(MacdStrategy)
-        
+        cerebro.addstrategy(AnchorLowStrategy)
         cerebro.broker.setcash(INITIAL_CASH)
         cerebro.broker.setcommission(commission=COMMISSION_RATE)
-        
-        # 使用 Sizer 来管理仓位，每次买入都用掉98%的现金
         cerebro.addsizer(bt.sizers.PercentSizer, percents=98)
-        
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='time_return')
         
         print("\n开始执行回测...")
